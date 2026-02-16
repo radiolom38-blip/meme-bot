@@ -1,0 +1,7 @@
+requests
+aiohttp
+python-telegram-bot
+flask
+scikit-learn
+pandas
+joblib
