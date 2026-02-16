@@ -19,11 +19,52 @@ if CHAT_ID == "YOUR_CHAT_ID" or not CHAT_ID:
 
 bot = Bot(token=TOKEN)
 
-DEX_URL = "https://api.dexscreener.com/latest/dex/pairs"
-
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
 model = load_model()
+
+# Функция для получения трендовых пар
+async def fetch_trending_pairs(session):
+    """Получает трендовые пары через поиск популярных токенов"""
+    pairs = []
+    
+    # Поиск популярных базовых токенов на разных сетях
+    search_queries = [
+        "SOL",  # Solana
+        "ETH",  # Ethereum  
+        "WBNB", # BSC
+        "WETH", # Base/Arbitrum
+        "PEPE", # Популярные мемкоины
+        "DOGE",
+        "SHIB",
+    ]
+    
+    for query in search_queries:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "pairs" in data:
+                        pairs.extend(data["pairs"][:15])  # Берем топ-15 пар для каждого запроса
+                elif resp.status == 404:
+                    print(f"⚠️ API endpoint not found for {query}")
+                else:
+                    print(f"⚠️ API returned status {resp.status} for {query}")
+                    
+                await asyncio.sleep(0.3)  # Задержка между запросами для соблюдения rate limit
+        except Exception as e:
+            print(f"⚠️ Error searching {query}: {e}")
+            continue
+    
+    # Удаляем дубликаты по pairAddress
+    unique_pairs = {}
+    for pair in pairs:
+        addr = pair.get("pairAddress")
+        if addr and addr not in unique_pairs:
+            unique_pairs[addr] = pair
+    
+    return list(unique_pairs.values())
 
 def momentum(prob):
     if prob > 80:
@@ -47,6 +88,8 @@ AI Probability: {data['prob']}%
 Momentum: {data['momentum']}
 Liquidity: ${data['liq']:,}
 24h Volume: ${data.get('volume24h', 'N/A')}
+
+📊 URL: {data.get('url', 'N/A')}
 """
     try:
         await bot.send_message(chat_id=CHAT_ID, text=msg)
@@ -59,33 +102,35 @@ async def scan():
 
     print("🤖 Starting meme pump scanner...")
     print(f"📊 Scan interval: {SCAN_INTERVAL}s")
+    print(f"🔧 Using DexScreener API v2 (search endpoint)")
     
     async with aiohttp.ClientSession() as session:
+        scan_count = 0
         while True:
             try:
-                print(f"🔍 Scanning DEX pairs...")
-                async with session.get(DEX_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        print(f"⚠️ API returned status {resp.status}")
-                        await asyncio.sleep(SCAN_INTERVAL)
-                        continue
-                    
-                    data = await resp.json()
-
-                if "pairs" not in data:
-                    print("⚠️ No pairs data in response")
+                scan_count += 1
+                print(f"\n{'='*50}")
+                print(f"🔍 Scan #{scan_count} - Fetching trending pairs...")
+                
+                # Получаем трендовые пары
+                pairs = await fetch_trending_pairs(session)
+                
+                if not pairs:
+                    print("⚠️ No pairs data received")
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
+                print(f"✅ Received {len(pairs)} unique pairs")
                 signals_sent = 0
-                for pair in data["pairs"][:80]:
+                
+                for pair in pairs:
                     try:
                         # Проверка ликвидности
                         if "liquidity" not in pair or "usd" not in pair["liquidity"]:
                             continue
                         
                         liq = pair["liquidity"]["usd"]
-                        if liq < 20000:
+                        if not liq or liq < 20000:
                             continue
 
                         token = pair.get("baseToken", {}).get("symbol", "UNKNOWN")
@@ -97,8 +142,18 @@ async def scan():
                         vsr = v5 / v1 if v1 > 0 else 0
 
                         # Безопасное извлечение транзакций
-                        buys = pair.get("txns", {}).get("m5", {}).get("buys", 0) or 0
-                        sells = pair.get("txns", {}).get("m5", {}).get("sells", 1) or 1
+                        txns_data = pair.get("txns", {})
+                        buys = 0
+                        sells = 1
+                        
+                        # Проверяем разные возможные ключи
+                        if "m5" in txns_data:
+                            buys = txns_data["m5"].get("buys", 0) or 0
+                            sells = txns_data["m5"].get("sells", 1) or 1
+                        elif "h1" in txns_data:
+                            buys = txns_data["h1"].get("buys", 0) or 0
+                            sells = txns_data["h1"].get("sells", 1) or 1
+                        
                         bp = buys / sells if sells > 0 else buys
 
                         txns = buys + sells
@@ -120,7 +175,8 @@ async def scan():
                                 "prob": prob,
                                 "momentum": m,
                                 "liq": int(liq),
-                                "volume24h": pair.get("volume", {}).get("h24", 0)
+                                "volume24h": pair.get("volume", {}).get("h24", 0),
+                                "url": pair.get("url", "")
                             })
 
                             save_training_data({
@@ -156,9 +212,10 @@ async def scan():
                 new_model = train_model()
                 if new_model:
                     model = new_model
-                    print("✅ Model retrained")
+                    print("🤖 Model retrained")
 
-                print(f"✅ Scan complete. Signals sent: {signals_sent}")
+                print(f"✅ Scan #{scan_count} complete. Signals sent: {signals_sent}/{len(pairs)}")
+                print(f"⏳ Sleeping for {SCAN_INTERVAL}s...")
                 await asyncio.sleep(SCAN_INTERVAL)
 
             except asyncio.TimeoutError:
@@ -166,8 +223,11 @@ async def scan():
                 await asyncio.sleep(5)
             except Exception as e:
                 print(f"❌ Error in scan loop: {e}")
+                import traceback
+                traceback.print_exc()
                 await asyncio.sleep(5)
 
 if __name__ == "__main__":
     print("🚀 Starting Meme Pump Bot...")
+    print("=" * 50)
     asyncio.run(scan())
